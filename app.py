@@ -6,8 +6,11 @@ import warnings
 
 import openai
 import streamlit as st
+import torch
 from audio_recorder_streamlit import audio_recorder
 from dotenv import load_dotenv
+from whisperplus import format_speech_to_dialogue
+from whisperplus.pipelines.whisper_diarize import ASRDiarizationPipeline
 
 warnings.filterwarnings("ignore")
 
@@ -23,6 +26,7 @@ st.sidebar.title("Medical Secretary GPT")
 
 load_dotenv()
 openai_api_key = os.getenv("OPENAI_API_KEY")
+huggingface_api_key = os.getenv("HUGGINGFACE_API_KEY")
 
 if not openai_api_key:
     openai_api_key = st.sidebar.text_input("Enter your OpenAI API key", type="password")
@@ -55,17 +59,29 @@ def get_test_audio():
 
 
 def transcribe(audio_file):
-    client = openai.OpenAI(api_key=openai_api_key)
-    if isinstance(audio_file, str):
-        with open(audio_file, "rb") as audio:
-            transcript = client.audio.transcriptions.create(
-                model="whisper-1", file=audio
-            )
+    # Determine the appropriate device
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif torch.backends.mps.is_available():
+        device = "mps"
     else:
-        transcript = client.audio.transcriptions.create(
-            model="whisper-1", file=audio_file
-        )
-    return transcript.text
+        device = "cpu"
+
+    pipeline = ASRDiarizationPipeline.from_pretrained(
+        asr_model="openai/whisper-large-v3",
+        diarizer_model="pyannote/speaker-diarization-3.1",
+        use_auth_token=huggingface_api_key,
+        chunk_length_s=30,
+        device=device,
+    )
+
+    # Process the audio file
+    output_text = pipeline(audio_file, num_speakers=2, min_speaker=1, max_speaker=2)
+
+    # Format the output as a dialogue
+    dialogue = format_speech_to_dialogue(output_text)
+
+    return dialogue
 
 
 def summarize(text):
@@ -79,7 +95,7 @@ def summarize(text):
                 "content": f"The text is a transcript of a medical consultation. Please summarize it, provide a list of the main issues and the doctor's recommendations:\n{text}",
             },
         ],
-        temperature=0.5,
+        temperature=0.1,
         max_tokens=560,
     )
     return response.choices[0].message.content.strip()
@@ -158,11 +174,13 @@ with tab2:
                 f.write(uploaded_file.getbuffer())
 
 if st.button("Transcribe") and st.session_state.audio_file_path:
-    st.session_state.transcript = transcribe(st.session_state.audio_file_path)
-    st.subheader("Transcript")
+    with st.spinner("Transcribing audio..."):
+        st.session_state.transcript = transcribe(st.session_state.audio_file_path)
+    st.subheader("Transcript with Speaker Diarization")
     st.write(st.session_state.transcript)
 
-    st.session_state.summary = summarize(st.session_state.transcript)
+    with st.spinner("Generating summary..."):
+        st.session_state.summary = summarize(st.session_state.transcript)
     st.subheader("Document")
     st.write(st.session_state.summary)
 
